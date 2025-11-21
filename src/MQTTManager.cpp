@@ -9,12 +9,14 @@
 #include "PeripheryManager.h"
 #include "UpdateManager.h"
 #include "PowerManager.h"
+#include <MbedTLSClient.h>
 
 const uint16_t PORT = 1883;
 
 WiFiClient espClient;
+MbedTLSClient tlsClient(espClient);
 HADevice device;
-HAMqtt mqtt(espClient, device, 26);
+HAMqtt *mqtt = nullptr;
 
 HALight *Matrix, *Indikator1, *Indikator2, *Indikator3 = nullptr;
 HASelect *BriMode, *transEffect = nullptr;
@@ -376,6 +378,10 @@ String MQTTManager_::getValueForTopic(const String &topic)
 
 void onMqttConnected()
 {
+    if(mqtt == nullptr) {
+        // message impossible
+        return;
+    }
 
     if (DEBUG_MODE)
         DEBUG_PRINTLN(F("MQTT Connected"));
@@ -408,13 +414,13 @@ void onMqttConnected()
     {
         if (DEBUG_MODE)
             DEBUG_PRINTF("Subscribe to topic %s", topic);
-        mqtt.subscribe((MQTT_PREFIX + topic).c_str());
+        mqtt->subscribe((MQTT_PREFIX + topic).c_str());
         delay(30);
     }
 
     for (const auto &topic : topicsToSubscribe)
     {
-        mqtt.subscribe(topic.c_str());
+        mqtt->subscribe(topic.c_str());
         if (DEBUG_MODE)
             Serial.printf("Subscribed to topic %s\n", topic.c_str());
     }
@@ -437,10 +443,14 @@ void onMqttConnected()
 
 bool MQTTManager_::subscribe(const char *topic)
 {
+    if(mqtt == nullptr) {
+        // MQTT not available
+        return false;
+    }
     mqttValues[topic] = "N/A";
-    if (mqtt.isConnected())
+    if (mqtt->isConnected())
     {
-        mqtt.subscribe(topic);
+        mqtt->subscribe(topic);
     }
     else
     {
@@ -451,9 +461,12 @@ bool MQTTManager_::subscribe(const char *topic)
 
 bool MQTTManager_::isConnected()
 {
+    if(mqtt == nullptr) {
+        return false;
+    }
     if (MQTT_HOST != "")
     {
-        return mqtt.isConnected();
+        return mqtt->isConnected();
     }
     else
     {
@@ -463,35 +476,41 @@ bool MQTTManager_::isConnected()
 
 void connect()
 {
-
-    mqtt.onMessage(onMqttMessage);
-    mqtt.onConnected(onMqttConnected);
+    if(mqtt == nullptr) {
+        // MQTT not available
+        return;
+    }
+    mqtt->onMessage(onMqttMessage);
+    mqtt->onConnected(onMqttConnected);
 
     if (!HA_DISCOVERY)
     {
         static char topic[50];
         snprintf(topic, sizeof(topic), "%s/stats/device", MQTT_PREFIX.c_str());
-        mqtt.setLastWill(topic, "offline", false);
+        mqtt->setLastWill(topic, "offline", false);
     }
 
     if (MQTT_USER == "" || MQTT_PASS == "")
     {
         if (DEBUG_MODE)
             DEBUG_PRINTLN(F("Connecting to MQTT w/o login"));
-        mqtt.begin(MQTT_HOST.c_str(), MQTT_PORT, nullptr, nullptr, HOSTNAME.c_str());
+        mqtt->begin(MQTT_HOST.c_str(), MQTT_PORT, nullptr, nullptr, HOSTNAME.c_str());
     }
     else
     {
         if (DEBUG_MODE)
             DEBUG_PRINTLN(F("Connecting to MQTT with login"));
-        mqtt.begin(MQTT_HOST.c_str(), MQTT_PORT, MQTT_USER.c_str(), MQTT_PASS.c_str(), HOSTNAME.c_str());
+        mqtt->begin(MQTT_HOST.c_str(), MQTT_PORT, MQTT_USER.c_str(), MQTT_PASS.c_str(), HOSTNAME.c_str());
     }
 }
 
 void MQTTManager_::sendStats()
 {
+    if(mqtt == nullptr) {
+        return;
+    }
 
-    if (HA_DISCOVERY && mqtt.isConnected())
+    if (HA_DISCOVERY && mqtt->isConnected())
     {
         char buffer[8];
 #ifndef awtrix2_upgrade
@@ -537,13 +556,28 @@ void MQTTManager_::sendStats()
 
 void MQTTManager_::setup()
 {
+    if(mqtt != nullptr) {
+        // Cannot call setup 2x
+    }
+
+    if(MQTT_TLS) {
+        if (LittleFS.exists("/cacert.pem"))
+        {
+            File file = LittleFS.open("/cacert.pem", "r");
+            String caCert = file.readString();
+            tlsClient.setCACert(caCert.begin());
+        }
+        mqtt = new HAMqtt(tlsClient, device, 26);
+    } else {
+        mqtt = new HAMqtt(espClient, device, 26);
+    }
 
     if (HA_DISCOVERY)
     {
         if (DEBUG_MODE)
             DEBUG_PRINTLN(F("Starting Homeassistant discovery"));
-        mqtt.setDiscoveryPrefix(HA_PREFIX.c_str());
-        mqtt.setDataPrefix(MQTT_PREFIX.c_str());
+        mqtt->setDiscoveryPrefix(HA_PREFIX.c_str());
+        mqtt->setDataPrefix(MQTT_PREFIX.c_str());
         uint8_t mac[6];
         WiFi.macAddress(mac);
         char macStr[7];
@@ -733,7 +767,7 @@ void MQTTManager_::setup()
     else
     {
         Serial.println(F("Homeassistant discovery disabled"));
-        mqtt.disableHA();
+        mqtt->disableHA();
     }
 
     connect();
@@ -741,9 +775,13 @@ void MQTTManager_::setup()
 
 void MQTTManager_::tick()
 {
+    if(mqtt == nullptr) {
+        // MQTT not available
+        return;
+    }
     if (MQTT_HOST != "")
     {
-        mqtt.loop();
+        mqtt->loop();
     }
     unsigned long currentMillis_Stats = millis();
     if ((currentMillis_Stats - previousMillis_Stats >= STATS_INTERVAL) && (SENSORS_STABLE))
@@ -755,30 +793,42 @@ void MQTTManager_::tick()
 
 void MQTTManager_::publish(const char *topic, const char *payload)
 {
+    if(mqtt == nullptr) {
+        // MQTT not available
+        return;
+    }
     char result[100];
     strcpy(result, MQTT_PREFIX.c_str());
     strcat(result, "/");
     strcat(result, topic);
 
-    if (!mqtt.isConnected())
+    if (!mqtt->isConnected())
         return;
 
-    mqtt.publish(result, payload, false);
+    mqtt->publish(result, payload, false);
 }
 
 void MQTTManager_::rawPublish(const char *prefix, const char *topic, const char *payload)
 {
-    if (!mqtt.isConnected())
+    if(mqtt == nullptr) {
+        // MQTT not available
+        return;
+    }
+    if (!mqtt->isConnected())
         return;
     char result[100];
     strcpy(result, prefix);
     strcat(result, "/");
     strcat(result, topic);
-    mqtt.publish(result, payload, false);
+    mqtt->publish(result, payload, false);
 }
 
 void MQTTManager_::setCurrentApp(String appName)
 {
+    if(mqtt == nullptr) {
+        // MQTT not available
+        return;
+    }
     static String lastApp = "";
 
     if (lastApp == appName)
@@ -786,7 +836,7 @@ void MQTTManager_::setCurrentApp(String appName)
 
     if (DEBUG_MODE)
         DEBUG_PRINTF("Publish current app %s", appName.c_str());
-    if (HA_DISCOVERY && mqtt.isConnected())
+    if (HA_DISCOVERY && mqtt->isConnected())
         curApp->setValue(appName.c_str());
 
     publish("stats/currentApp", appName.c_str());
@@ -795,6 +845,10 @@ void MQTTManager_::setCurrentApp(String appName)
 
 void MQTTManager_::sendButton(byte btn, bool state)
 {
+    if(mqtt == nullptr) {
+        // MQTT not available
+        return;
+    }
     static bool btn0State, btn1State, btn2State;
 
     switch (btn)
@@ -802,7 +856,7 @@ void MQTTManager_::sendButton(byte btn, bool state)
     case 0:
         if (btn0State != state)
         {
-            if (HA_DISCOVERY && mqtt.isConnected())
+            if (HA_DISCOVERY && mqtt->isConnected())
                 btnleft->setState(state, false);
             btn0State = state;
             publish(ButtonLeftTopic, state ? State1 : State0);
@@ -811,7 +865,7 @@ void MQTTManager_::sendButton(byte btn, bool state)
     case 1:
         if (btn1State != state)
         {
-            if (HA_DISCOVERY && mqtt.isConnected())
+            if (HA_DISCOVERY && mqtt->isConnected())
                 btnmid->setState(state, false);
             btn1State = state;
             publish(ButtonSelectTopic, state ? State1 : State0);
@@ -821,7 +875,7 @@ void MQTTManager_::sendButton(byte btn, bool state)
     case 2:
         if (btn2State != state)
         {
-            if (HA_DISCOVERY && mqtt.isConnected())
+            if (HA_DISCOVERY && mqtt->isConnected())
                 btnright->setState(state, false);
             btn2State = state;
             publish(ButtonRightTopic, state ? State1 : State0);
@@ -834,7 +888,11 @@ void MQTTManager_::sendButton(byte btn, bool state)
 
 void MQTTManager_::setIndicatorState(uint8_t indicator, bool state, uint32_t color)
 {
-    if (HA_DISCOVERY && mqtt.isConnected())
+    if(mqtt == nullptr) {
+        // MQTT not available
+        return;
+    }
+    if (HA_DISCOVERY && mqtt->isConnected())
     {
         HALight::RGBColor c;
         c.isSet = true;
@@ -864,15 +922,27 @@ void MQTTManager_::setIndicatorState(uint8_t indicator, bool state, uint32_t col
 
 void MQTTManager_::beginPublish(const char *topic, unsigned int plength, boolean retained)
 {
-    mqtt.beginPublish(topic, plength, retained);
+    if(mqtt == nullptr) {
+        // MQTT not available
+        return;
+    }
+    mqtt->beginPublish(topic, plength, retained);
 }
 
 void MQTTManager_::writePayload(const char *data, const uint16_t length)
 {
-    mqtt.writePayload(data, length);
+    if(mqtt == nullptr) {
+        // MQTT not available
+        return;
+    }
+    mqtt->writePayload(data, length);
 }
 
 void MQTTManager_::endPublish()
 {
-    mqtt.endPublish();
+    if(mqtt == nullptr) {
+        // MQTT not available
+        return;
+    }
+    mqtt->endPublish();
 }
