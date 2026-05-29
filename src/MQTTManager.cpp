@@ -659,7 +659,9 @@ void MQTTManager_::startTask()
     mqttMutex = xSemaphoreCreateRecursiveMutex();
     // Pin to core 0 (PRO_CPU). Main loop runs on core 1 (APP_CPU); the
     // blocking TLS handshake on this task no longer starves HTTP / display.
-    xTaskCreatePinnedToCore(mqttTaskFn, "mqtt", 12288, nullptr, 1, nullptr, 0);
+    // Stack size: high-water-mark logging shows we peak at ~2.6 KB during
+    // setup/handshake and stay there steady-state. 6 KB gives ~1.3× margin.
+    xTaskCreatePinnedToCore(mqttTaskFn, "mqtt", 6144, nullptr, 1, nullptr, 0);
 }
 
 bool MQTTManager_::isFirstConnectSettled()
