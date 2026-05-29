@@ -125,6 +125,11 @@
      }
      mbedtls_ssl_conf_rng(&_conf, mbedtls_ctr_drbg_random, &_ctr_drbg);
      mbedtls_ssl_conf_read_timeout(&_conf, _timeout_ms);
+     // ALPN: required for AWS IoT Core custom-authorizer connections over
+     // port 443. Static lifetime so the pointer stays valid for the entire
+     // handshake. AWS recognizes 'mqtt' as the MQTT-over-ALPN protocol.
+     static const char *alpn_protos[] = {"mqtt", NULL};
+     mbedtls_ssl_conf_alpn_protocols(&_conf, alpn_protos);
      mbedtls_ssl_setup(&_ssl, &_conf);
      mbedtls_ssl_set_hostname(&_ssl, host);
      mbedtls_ssl_set_bio(&_ssl, this, ssl_send, ssl_recv, NULL);
