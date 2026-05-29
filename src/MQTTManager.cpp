@@ -607,6 +607,15 @@ static void mqttTaskFn(void *)
     // setup() does the blocking TLS handshake; runs entirely on this task.
     MQTTManager.setup();
     firstConnectSettled = true;
+
+    // Track the worst-case (smallest) stack-words-remaining ever observed,
+    // and the smallest heap-bytes-ever-free. Both report to Serial every
+    // 30 s so we can right-size the task stack and judge overall memory
+    // pressure with real numbers rather than by guessing.
+    UBaseType_t minStackWordsFree = uxTaskGetStackHighWaterMark(NULL);
+    size_t minHeapFreeEver = ESP.getMinFreeHeap();
+    unsigned long lastReport = 0;
+
     for (;;)
     {
         if (xSemaphoreTakeRecursive(mqttMutex, portMAX_DELAY) == pdTRUE)
@@ -614,6 +623,22 @@ static void mqttTaskFn(void *)
             MQTTManager.tick();
             xSemaphoreGiveRecursive(mqttMutex);
         }
+
+        UBaseType_t stackFree = uxTaskGetStackHighWaterMark(NULL);
+        if (stackFree < minStackWordsFree) minStackWordsFree = stackFree;
+        size_t heapFreeEver = ESP.getMinFreeHeap();
+        if (heapFreeEver < minHeapFreeEver) minHeapFreeEver = heapFreeEver;
+
+        unsigned long n = millis();
+        if (n - lastReport >= 30000) {
+            lastReport = n;
+            Serial.printf("[mqtt-rss] stack_min_free=%u words (%u B), heap_min_free=%u B, heap_now=%u B\n",
+                          (unsigned)minStackWordsFree,
+                          (unsigned)(minStackWordsFree * sizeof(StackType_t)),
+                          (unsigned)minHeapFreeEver,
+                          (unsigned)ESP.getFreeHeap());
+        }
+
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
