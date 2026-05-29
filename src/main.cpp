@@ -100,8 +100,19 @@ void setup()
       if (MQTT_HOST != "")
       {
         DisplayManager.HSVtext(4, 6, "MQTT...", true, 0);
-        MQTTManager.setup();
-        MQTTManager.tick();
+        // setup() + the periodic tick now run on their own FreeRTOS task
+        // pinned to core 0, so the blocking TLS handshake doesn't starve
+        // the main loop on core 1 (HTTP/display stay responsive).
+        MQTTManager.startTask();
+        // Block here until the MQTT task's first connect attempt has
+        // settled (success or fail), or 60 s elapse. Otherwise the rest
+        // of the OS starts running during the handshake and the display
+        // jitters from RAM/IRQ contention with mbedtls.
+        const unsigned long mqttDeadline = millis() + 60000;
+        while (!MQTTManager.isFirstConnectSettled() && millis() < mqttDeadline)
+        {
+            delay(100);
+        }
       }
     
   }
@@ -120,8 +131,6 @@ void loop()
   ServerManager.tick();
   DisplayManager.tick();
   PeripheryManager.tick();
-  if (ServerManager.isConnected)
-  {
-    MQTTManager.tick();
-  }
+  // MQTTManager.tick() runs on its own pinned task (see startTask()); no
+  // need to call it from here, and doing so would race with the task.
 }

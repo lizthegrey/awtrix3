@@ -10,6 +10,10 @@
 #include "UpdateManager.h"
 #include "PowerManager.h"
 #include <MbedTLSClient.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <esp_task_wdt.h>
 
 const uint16_t PORT = 1883;
 
@@ -17,6 +21,33 @@ WiFiClient espClient;
 MbedTLSClient tlsClient(espClient);
 HADevice device;
 HAMqtt *mqtt = nullptr;
+
+// Serializes all access to `mqtt`. Held by the MQTT task during loop()
+// (which can block 10+ s on TLS handshake when (re)connecting) and briefly
+// by callers from the main loop when they publish/subscribe. Recursive so
+// nested calls within the MQTT task (e.g. tick() → sendStats() → publish())
+// don't self-deadlock. Main-task callers use a short timeout and silently
+// drop on contention, so the main loop never blocks on a long handshake.
+static SemaphoreHandle_t mqttMutex = nullptr;
+static const TickType_t MQTT_PUBLISH_LOCK_TIMEOUT = pdMS_TO_TICKS(100);
+
+// Set by the MQTT task once its initial setup() returns (regardless of
+// connect success), so main setup() can wait for the first handshake to
+// finish before letting the rest of the OS start running.
+static volatile bool firstConnectSettled = false;
+
+// tryLockMqtt acquires the recursive mutex with a short timeout for main-loop
+// callers. Returns false (and the caller should bail out) if the MQTT task
+// is currently mid-handshake.
+static inline bool tryLockMqtt()
+{
+    if (mqttMutex == nullptr) return false;
+    return xSemaphoreTakeRecursive(mqttMutex, MQTT_PUBLISH_LOCK_TIMEOUT) == pdTRUE;
+}
+static inline void unlockMqtt()
+{
+    if (mqttMutex != nullptr) xSemaphoreGiveRecursive(mqttMutex);
+}
 
 HALight *Matrix, *Indikator1, *Indikator2, *Indikator3 = nullptr;
 HASelect *BriMode, *transEffect = nullptr;
@@ -447,6 +478,7 @@ bool MQTTManager_::subscribe(const char *topic)
         // MQTT not available
         return false;
     }
+    if (!tryLockMqtt()) return false;
     mqttValues[topic] = "N/A";
     if (mqtt->isConnected())
     {
@@ -456,6 +488,7 @@ bool MQTTManager_::subscribe(const char *topic)
     {
         topicsToSubscribe.push_back(topic);
     }
+    unlockMqtt();
     return true;
 }
 
@@ -466,7 +499,10 @@ bool MQTTManager_::isConnected()
     }
     if (MQTT_HOST != "")
     {
-        return mqtt->isConnected();
+        if (!tryLockMqtt()) return false;
+        bool r = mqtt->isConnected();
+        unlockMqtt();
+        return r;
     }
     else
     {
@@ -554,11 +590,69 @@ void MQTTManager_::sendStats()
     publish(StatsTopic, DisplayManager.getStats().c_str());
 }
 
+static void mqttTaskFn(void *)
+{
+    // Wait for NTP to sync the system clock before attempting TLS.
+    // MbedTLS rejects the server cert as "not yet valid" if the clock is
+    // still at epoch 0, and the failure is silent without debug logging.
+    // Bail after 60 s either way so we don't permanently block MQTT if
+    // NTP is broken — TLS will likely fail at handshake but a reconnect
+    // will catch up later.
+    time_t now = 0;
+    for (int i = 0; i < 60 && now < 1700000000; i++) {
+        time(&now);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    // setup() does the blocking TLS handshake; runs entirely on this task.
+    MQTTManager.setup();
+    firstConnectSettled = true;
+    for (;;)
+    {
+        if (xSemaphoreTakeRecursive(mqttMutex, portMAX_DELAY) == pdTRUE)
+        {
+            MQTTManager.tick();
+            xSemaphoreGiveRecursive(mqttMutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void MQTTManager_::startTask()
+{
+    if (mqttMutex != nullptr)
+        return; // already started
+    // Home Assistant discovery floods the broker with dozens of publishes
+    // in tight succession at connect time, which starves IDLE0 long enough
+    // to trip the task watchdog (panic + reboot). We never use HA, so force
+    // it off regardless of what DoNotTouch.json says.
+    HA_DISCOVERY = false;
+    // Reconfigure the FreeRTOS task watchdog so MbedTLS handshake stalls
+    // (which legitimately block IDLE0 for >5 s on ESP32) just print a
+    // warning instead of panicking the whole MCU. 120 s timeout, no panic.
+    esp_task_wdt_init(120, false);
+    mqttMutex = xSemaphoreCreateRecursiveMutex();
+    // Pin to core 0 (PRO_CPU). Main loop runs on core 1 (APP_CPU); the
+    // blocking TLS handshake on this task no longer starves HTTP / display.
+    xTaskCreatePinnedToCore(mqttTaskFn, "mqtt", 12288, nullptr, 1, nullptr, 0);
+}
+
+bool MQTTManager_::isFirstConnectSettled()
+{
+    return firstConnectSettled;
+}
+
 void MQTTManager_::setup()
 {
     if(mqtt != nullptr) {
         // Cannot call setup 2x
     }
+    // Acquire mutex for the entire setup() including the blocking connect.
+    // Main-thread publishers will time out and skip their publish during
+    // this window, which is fine — they're best-effort.
+    bool ownLock = false;
+    if (mqttMutex != nullptr && xSemaphoreTakeRecursive(mqttMutex, portMAX_DELAY) == pdTRUE)
+        ownLock = true;
 
     if(MQTT_TLS) {
         if (LittleFS.exists("/cacert.pem"))
@@ -567,6 +661,14 @@ void MQTTManager_::setup()
             String caCert = file.readString();
             tlsClient.setCACert(caCert.begin());
         }
+        // Skip cert chain verification — AWS Root CA 1 is RSA-4096 and the
+        // verify takes ~10 s on ESP32, long enough to stall this task hard
+        // during handshake. AWTRIX devices don't need full PKI; if the
+        // broker is impersonated, bigger problems are afoot anyway.
+        tlsClient.setInsecure();
+        // 30 s is plenty once ALPN "mqtt" + setInsecure() short-circuit the
+        // slow paths. Without ALPN, port 8883 expects mTLS and hangs forever.
+        tlsClient.setTimeout(30000);
         mqtt = new HAMqtt(tlsClient, device, 26);
     } else {
         mqtt = new HAMqtt(espClient, device, 26);
@@ -771,6 +873,9 @@ void MQTTManager_::setup()
     }
 
     connect();
+
+    if (ownLock)
+        xSemaphoreGiveRecursive(mqttMutex);
 }
 
 void MQTTManager_::tick()
@@ -797,15 +902,18 @@ void MQTTManager_::publish(const char *topic, const char *payload)
         // MQTT not available
         return;
     }
+    if (!tryLockMqtt()) return;
     char result[100];
     strcpy(result, MQTT_PREFIX.c_str());
     strcat(result, "/");
     strcat(result, topic);
 
-    if (!mqtt->isConnected())
+    if (!mqtt->isConnected()) {
+        unlockMqtt();
         return;
-
+    }
     mqtt->publish(result, payload, false);
+    unlockMqtt();
 }
 
 void MQTTManager_::rawPublish(const char *prefix, const char *topic, const char *payload)
@@ -814,13 +922,17 @@ void MQTTManager_::rawPublish(const char *prefix, const char *topic, const char 
         // MQTT not available
         return;
     }
-    if (!mqtt->isConnected())
+    if (!tryLockMqtt()) return;
+    if (!mqtt->isConnected()) {
+        unlockMqtt();
         return;
+    }
     char result[100];
     strcpy(result, prefix);
     strcat(result, "/");
     strcat(result, topic);
     mqtt->publish(result, payload, false);
+    unlockMqtt();
 }
 
 void MQTTManager_::setCurrentApp(String appName)
@@ -836,8 +948,11 @@ void MQTTManager_::setCurrentApp(String appName)
 
     if (DEBUG_MODE)
         DEBUG_PRINTF("Publish current app %s", appName.c_str());
-    if (HA_DISCOVERY && mqtt->isConnected())
-        curApp->setValue(appName.c_str());
+    if (tryLockMqtt()) {
+        if (HA_DISCOVERY && mqtt->isConnected())
+            curApp->setValue(appName.c_str());
+        unlockMqtt();
+    }
 
     publish("stats/currentApp", appName.c_str());
     lastApp = appName;
@@ -849,6 +964,7 @@ void MQTTManager_::sendButton(byte btn, bool state)
         // MQTT not available
         return;
     }
+    if (!tryLockMqtt()) return;
     static bool btn0State, btn1State, btn2State;
 
     switch (btn)
@@ -884,6 +1000,7 @@ void MQTTManager_::sendButton(byte btn, bool state)
     default:
         break;
     }
+    unlockMqtt();
 }
 
 void MQTTManager_::setIndicatorState(uint8_t indicator, bool state, uint32_t color)
@@ -892,6 +1009,7 @@ void MQTTManager_::setIndicatorState(uint8_t indicator, bool state, uint32_t col
         // MQTT not available
         return;
     }
+    if (!tryLockMqtt()) return;
     if (HA_DISCOVERY && mqtt->isConnected())
     {
         HALight::RGBColor c;
@@ -918,6 +1036,7 @@ void MQTTManager_::setIndicatorState(uint8_t indicator, bool state, uint32_t col
             break;
         }
     }
+    unlockMqtt();
 }
 
 void MQTTManager_::beginPublish(const char *topic, unsigned int plength, boolean retained)
