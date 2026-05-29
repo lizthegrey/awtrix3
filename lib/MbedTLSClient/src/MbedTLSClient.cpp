@@ -97,6 +97,10 @@
      _timeout_ms = timeout_ms;
  }
  
+ void MbedTLSClient::setInsecure() {
+     _verify_required = false;
+ }
+ 
  int MbedTLSClient::connect(const char *host, uint16_t port) {
      int ret;
      if (connected()) stop();
@@ -115,7 +119,7 @@
      mbedtls_ctr_drbg_seed(&_ctr_drbg, mbedtls_entropy_func, &_entropy, NULL, 0);
      mbedtls_ssl_config_defaults(&_conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
      mbedtls_x509_crt_parse(&_cacert, (const unsigned char *)_ca_cert_buf.get(), strlen(_ca_cert_buf.get()) + 1);
-     mbedtls_ssl_conf_authmode(&_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+     mbedtls_ssl_conf_authmode(&_conf, _verify_required ? MBEDTLS_SSL_VERIFY_REQUIRED : MBEDTLS_SSL_VERIFY_NONE);
      mbedtls_ssl_conf_ca_chain(&_conf, &_cacert, NULL);
  
      if (_client_cert_buf && _client_key_buf) {

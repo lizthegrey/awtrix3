@@ -72,6 +72,15 @@
       * @param timeout_ms The timeout duration in milliseconds. Defaults to 30000 (30 seconds).
       */
      void setTimeout(uint32_t timeout_ms);
+
+     /**
+      * @brief Disable server certificate chain verification.
+      * Useful when the server is reached over a network you already
+      * trust (e.g. AWS IoT Core via TLS where the cost of the RSA root
+      * verify is significant and a MITM would imply the entire AWS
+      * platform is compromised). Call before connect().
+      */
+     void setInsecure();
  
      // --- Arduino Client API Implementation ---
  
@@ -182,6 +191,7 @@
  
      Client *_transport;
      uint32_t _timeout_ms = 30000;
+     bool _verify_required = true;
      HandshakeState _handshake_state = HandshakeState::NOT_STARTED;
  
      // mbedTLS context structures
